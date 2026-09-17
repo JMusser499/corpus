@@ -9,6 +9,7 @@ import pytest
 
 from pipeline import main, metadata, runner, stages
 from pipeline.build_inputs import config_fingerprints, configuration_drift
+from pipeline.config import load_config
 from pipeline.figure_materialization import rebuild_figure_base
 from pipeline.figures import link_chunks_to_figures
 from tests import test_metadata_resume
@@ -22,6 +23,7 @@ corpus = test_metadata_resume.corpus  # Shared pipeline fixture, registered here
     ("ocr", "jobs", 2, "pdf_preparation", "scan_detection"),
     ("chunking", "max_tokens", 50, "text_chunking", "figure_materialization"),
     ("figures", "images_scale", 4, "docling_extraction", "metadata_extraction"),
+    ("figures", "max_pixels_long_side", 2500, "docling_extraction", "metadata_extraction"),
     ("grobid", "consolidate_citations", 1, "metadata_extraction", "docling_extraction"),
     ("quality_gates", "empty_text_min_chars", 20, "quality_gates", "scan_detection"),
 ])
@@ -37,6 +39,19 @@ def test_defaults_and_explicit_defaults_have_identical_fingerprints():
     from pipeline.config import _DEFAULT_CONFIG
     assert config_fingerprints({}, panel_mode="ocr") == config_fingerprints(
         copy.deepcopy(_DEFAULT_CONFIG), panel_mode="ocr")
+
+
+def test_omitted_pixel_cap_resolves_and_fingerprints_as_3000(tmp_path):
+    omitted = tmp_path / "omitted.yaml"
+    explicit = tmp_path / "explicit.yaml"
+    omitted.write_text("{}\n")
+    explicit.write_text("figures:\n  max_pixels_long_side: 3000\n")
+
+    omitted_config = load_config(omitted)
+    explicit_config = load_config(explicit)
+    assert omitted_config["figures"]["max_pixels_long_side"] == 3000
+    assert config_fingerprints(omitted_config, panel_mode="ocr") == config_fingerprints(
+        explicit_config, panel_mode="ocr")
 
 
 def test_chunk_setting_rechunks_without_ocr_metadata_or_figure_detection(corpus, monkeypatch):
@@ -162,19 +177,32 @@ def test_keyboard_interrupt_never_records_success(tmp_path):
     assert "docling_extraction" not in stages._load_pipeline_state(tmp_path)["stages"]
 
 
-def test_raster_change_replaces_old_images_and_missing_docling_sidecar(corpus, monkeypatch):
+@pytest.mark.parametrize("key,value", [
+    ("images_scale", 4),
+    ("max_pixels_long_side", 2500),
+])
+def test_raster_change_replaces_old_images_and_invalidates_descendants(
+        corpus, monkeypatch, key, value):
     _install_figure_stubs(monkeypatch)
     corpus.run("--figure-panels", "off")
     hd = corpus.hd()
     (hd / "figures" / "obsolete.png").write_bytes(b"previous generation")
     (hd / "docling_doc.json").write_text('{"old": true}')
     before = stages._load_pipeline_state(hd)["stages"]
-    corpus.config.write_text('figures:\n  panel_detection: "off"\n  images_scale: 4\n')
+    corpus.config.write_text(
+        f'figures:\n  panel_detection: "off"\n  {key}: {value}\n')
     corpus.run()
     assert sorted(p.name for p in (hd / "figures").iterdir()) == ["raw.png"]
     assert not (hd / "docling_doc.json").exists()
     after = stages._load_pipeline_state(hd)["stages"]
-    assert before["docling_extraction"] != after["docling_extraction"]
+    changed_fingerprints = {
+        stage for stage in before
+        if before[stage]["input_fingerprint"] != after[stage]["input_fingerprint"]
+    }
+    assert changed_fingerprints == {
+        "docling_extraction", "text_chunking", "taxa_and_lexicon_extraction",
+        "figure_materialization", "figure_crossref",
+    }
     for stage in ("scan_detection", "pdf_preparation", "metadata_extraction"):
         assert before[stage] == after[stage]
 

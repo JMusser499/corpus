@@ -179,6 +179,7 @@ _DEFAULT_CONFIG = {
         "resolution_mode": "native",
         "vector_dpi": 300.0,
         "max_dpi": None,
+        "max_pixels_long_side": 3000,
         "images_scale": 2.0,
     },
     # Per-stage wallclock caps in seconds (#34). Hard-enforced where

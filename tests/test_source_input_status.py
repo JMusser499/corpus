@@ -3,6 +3,7 @@ import json
 
 import pytest
 
+from pipeline import taxonomy_ingest
 from pipeline.build_inputs import source_input_drift
 from pipeline.stages import _load_pipeline_state
 from tests import test_metadata_resume
@@ -58,6 +59,34 @@ def test_annotation_addition_and_removal_are_reported(corpus):
     configure(corpus)
     changes = source_input_drift(corpus.output, corpus.config)["differences"][hd.name]
     assert changes["taxa_and_lexicon_extraction"] == ["lexicons.anatomy.sha256"]
+
+
+def test_taxonomy_audit_uses_the_producers_stable_source_receipt(corpus, monkeypatch):
+    configure(corpus)
+    source = corpus.config.parent / "Taxon.tsv"
+    source.write_text(
+        "taxonID\tscientificName\tparentNameUsageID\n"
+        "1\tAlpha\t\n"
+        "2\tBeta\t1\n"
+    )
+
+    def ingest(*extra):
+        monkeypatch.setattr(
+            "sys.argv",
+            ["ingest", str(corpus.output), "--source", "dwc", "--input", str(source), *extra],
+        )
+        assert taxonomy_ingest.main() == 0
+
+    ingest()
+    corpus.run(annotations=True)
+    assert source_input_drift(corpus.output, corpus.config)["differences"] == {}
+
+    # Rebuilding an unchanged source rewrites volatile SQLite timestamps but
+    # preserves the receipt that identifies the consumed taxonomy input.
+    before = (corpus.output / "taxonomy.sqlite").read_bytes()
+    ingest("--rebuild")
+    assert (corpus.output / "taxonomy.sqlite").read_bytes() != before
+    assert source_input_drift(corpus.output, corpus.config)["differences"] == {}
 
 
 def test_missing_configured_source_is_an_error_not_zero_drift(corpus):

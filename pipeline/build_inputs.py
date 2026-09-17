@@ -33,8 +33,14 @@ def config_fingerprints(config, *, panel_mode, vision_model=None, resolved_visio
     ))
     prep = {**scan, **select("ocr", ("optimize_level", "tesseract_page_timeout", "jobs")),
             **select("stage_timeouts", ("ocr", "ocr_per_page"))}
-    extract = {**prep, **select("figures", ("resolution_mode", "images_scale", "vector_dpi", "max_dpi")),
-               "compute.accelerator": cfg.get("compute", {}).get("accelerator", "auto")}
+    extract = {
+        **prep,
+        **select("figures", (
+            "resolution_mode", "images_scale", "vector_dpi", "max_dpi",
+            "max_pixels_long_side",
+        )),
+        "compute.accelerator": cfg.get("compute", {}).get("accelerator", "auto"),
+    }
     chunks = {**extract, **select("chunking", ("max_tokens",))}
     figures = {**extract, "figures.panel_detection": panel_mode}
     if panel_mode.startswith("vision-"):
@@ -134,8 +140,20 @@ def source_input_drift(output_dir: Path, config_path: Path):
         load_lexicon(lexicon_path)  # Validate before treating it as current input.
     lexicons = lexicon_fingerprints(lexicon_path) if lexicon_path else {}
     taxonomy_path = output_dir / "taxonomy.sqlite"
-    taxonomy = ({"path": str(taxonomy_path), "sha256": _file_sha256(taxonomy_path),
-                 "size": taxonomy_path.stat().st_size} if taxonomy_path.exists() else None)
+    taxonomy = None
+    if taxonomy_path.exists():
+        from .taxonomy_ingest import snapshot_receipt
+        receipt = snapshot_receipt(taxonomy_path)
+        taxonomy = {"path": str(taxonomy_path)}
+        if receipt is not None:
+            # Match the producer in main.py: the consumed-source receipt is
+            # stable when an identical ingest rewrites SQLite timestamps.
+            taxonomy["input_fingerprint"] = receipt
+        else:
+            # Legacy snapshots predate receipts; keep the producer's same
+            # file-identity fallback until the snapshot is re-ingested.
+            taxonomy["sha256"] = _file_sha256(taxonomy_path)
+            taxonomy["size"] = taxonomy_path.stat().st_size
     taxonomy_source = {"configured": False}
     tx = config.get("taxonomy") or {}
     if tx.get("source"):
