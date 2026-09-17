@@ -46,7 +46,7 @@ _PLATE_CAPTION_RE = re.compile(
 # archaic German "Tafel" (Taf.) and Latin "Tabula" (Tab.) used as plate
 # labels in 19th-c. monographs (#16).
 _FIGURE_PREFIX = (
-    r"fig(?:ure|\.?)|abb(?:ildung|\.?)|pl(?:ate|\.?)|plate|рис(?:унок|\.?)"
+    r"fig(?:ures?|s?\.?)|abb(?:ildung|\.?)|pl(?:ate|\.?)|plate|рис(?:унок|\.?)"
     r"|image|illustration|lám(?:ina|\.?)|tav(?:ola|\.?)|bild"
     r"|text[\-\s]?fig(?:ure|\.?)"
     r"|taf(?:el|\.?)|tab(?:ula|\.?)"
@@ -59,7 +59,8 @@ _FIGURE_REF_RE = re.compile(
     + _FIGURE_PREFIX
     + r""")   # prefix
     \s*
-    (\d+)                                                                        # number
+    (?P<first>\d+)                            # number
+    (?:\s*[-\u2013\u2014]\s*(?P<last>\d+))? # compound/range tail
     """,
     re.IGNORECASE | re.VERBOSE,
 )
@@ -115,6 +116,16 @@ _FIGURE_NUMBER_IN_CAPTION_RE = re.compile(
     r"|(?:" + _CAPTION_OPENER_FUZZY + r")\s*[.,]\s*"  # punctuation required
     r")"
     r"(" + _FIGURE_NUMBER_TOKEN + r")",
+    re.IGNORECASE,
+)
+
+# Simpson-style monographs number figures within chapters (``Figure 4-37``).
+# The full singular opener is the distinguishing caption evidence: abbreviated
+# ``Fig. 58-63`` and plural ``Figs./Figg.`` ranges are established collective
+# forms elsewhere in the corpus and must continue to expand.
+_CHAPTER_STYLE_FIGURE_NUMBER_RE = re.compile(
+    r"^[\s._\-\u2013\u2014\u00b7\u2022]*figure\s*\.?\s*"
+    r"(?P<chapter>\d+)\s*[-\u2013\u2014]\s*(?P<number>\d+)",
     re.IGNORECASE,
 )
 
@@ -375,9 +386,39 @@ def parse_panels_from_caption(caption_text: str) -> List[Dict]:
 # figures the running text cites that docling didn't extract. Trailing
 # lookahead excludes "Fig. 4.1" (subsection) and "Figure N,000" (numerics).
 _FIGURE_MENTION_RE = re.compile(
-    r"\b(?:" + _FIGURE_PREFIX + r")\s*(\d+)(?![\w.,]\d)",
+    r"\b(?:" + _FIGURE_PREFIX + r")\s*(?P<first>\d+)"
+    r"(?:\s*[-\u2013\u2014]\s*(?P<last>\d+))?(?![\w.,]\d)",
     re.IGNORECASE,
 )
+
+
+def _reference_figure_number(match, known_numbers) -> str:
+    """Resolve an ambiguous ``Fig. A-B`` mention against known identities.
+
+    A hyphenated singular abbreviation can be either a chapter-style figure
+    identifier or a printed numeric range. Prefer the compound identifier when
+    that exact key exists or the document already uses the same chapter-number
+    namespace; otherwise retain the historical first-number interpretation
+    used by range references.
+    """
+    first = match.group("first")
+    last = match.group("last")
+    if last:
+        compound = f"{first}-{last}"
+        known = {str(number) for number in known_numbers}
+        chapter_prefix = f"{first}-"
+        same_chapter = any(
+            number.startswith(chapter_prefix)
+            and re.fullmatch(
+                _FIGURE_NUMBER_TOKEN,
+                number[len(chapter_prefix):],
+                re.IGNORECASE,
+            )
+            for number in known
+        )
+        if compound in known or same_chapter:
+            return compound
+    return first
 
 
 def _extract_caption_candidate_for_number(text: str, figure_number: str) -> str:
@@ -445,7 +486,8 @@ def detect_missing_figures(text: str, extracted_numbers) -> List[Dict]:
     # inspect context.
     mentions_by_num: Dict[str, List[int]] = {}
     for m in _FIGURE_MENTION_RE.finditer(text):
-        mentions_by_num.setdefault(m.group(1), []).append(m.end())
+        number = _reference_figure_number(m, extracted)
+        mentions_by_num.setdefault(number, []).append(m.end())
 
     missing = set(mentions_by_num) - extracted
     if not missing:
@@ -493,12 +535,18 @@ def parse_figure_number(caption_text: str) -> Optional[str]:
 
     Roman numerals (e.g. "Plate IV.", "Taf. III.") are normalized to
     their Arabic form ("4", "3") so they join cleanly to body-text
-    references that use Arabic numerals (#16). Best-effort, intended
-    as a join key for body-text references, not as a canonical
-    identifier.
+    references that use Arabic numerals (#16). Full singular chapter-style
+    labels retain both components (``Figure 4-37`` → ``"4-37"``). The result
+    is the persisted join key; extraction remains best-effort and does not
+    infer an identifier beyond the printed label.
     """
     if not caption_text:
         return None
+    chapter_match = _CHAPTER_STYLE_FIGURE_NUMBER_RE.match(caption_text)
+    if chapter_match:
+        chapter = _canonical_figure_number(chapter_match.group("chapter"))
+        number = _canonical_figure_number(chapter_match.group("number"))
+        return f"{chapter}-{number}"
     m = _FIGURE_NUMBER_IN_CAPTION_RE.match(caption_text)
     if not m:
         return None
@@ -559,8 +607,10 @@ def caption_figure_entries(caption_text: str) -> List[Dict]:
 
     ``Fig. 10. ... Fig. 11. ...`` yields separate text for 10 and 11.
     Lists (``Figur 8 und 9``) share one text segment, while numeric ranges
-    (``Fig. 58-63``) expand inclusively. Lettered panels remain outside this
-    parser and are handled by :func:`parse_panels_from_caption`.
+    (``Fig. 58-63``) expand inclusively. Full singular chapter-style labels
+    (``Figure 4-37``) retain ``4-37`` as one identifier. Lettered panels
+    remain outside this parser and are handled by
+    :func:`parse_panels_from_caption`.
     """
     text = caption_text or ""
     if not parse_figure_number(text):
@@ -595,17 +645,21 @@ def caption_figure_entries(caption_text: str) -> List[Dict]:
         stop = matches[i + 1].start() if i + 1 < len(matches) else len(text)
         segment = text[match.start():stop].strip()
         numbers = [_canonical_figure_number(match.group("first"))]
+        chapter_style = bool(_CHAPTER_STYLE_FIGURE_NUMBER_RE.match(segment))
         previous = numbers[0]
         for term in _FIGURE_ENUM_TAIL_TERM_RE.finditer(match.group("tail") or ""):
             connector = term.group("connector").lower().rstrip(".")
             number = _canonical_figure_number(term.group("number"))
             if connector in {"-", "\u2013", "\u2014"} \
                     and previous.isdigit() and number.isdigit():
-                start, end = int(previous), int(number)
-                if 0 < end - start <= 100:
-                    numbers.extend(str(n) for n in range(start + 1, end + 1))
-                elif number not in numbers:
-                    numbers.append(number)
+                if chapter_style and numbers[-1] == previous:
+                    numbers[-1] = f"{previous}-{number}"
+                else:
+                    start, end = int(previous), int(number)
+                    if 0 < end - start <= 100:
+                        numbers.extend(str(n) for n in range(start + 1, end + 1))
+                    elif number not in numbers:
+                        numbers.append(number)
             elif number not in numbers:
                 numbers.append(number)
             previous = number
@@ -701,7 +755,10 @@ def _horizontal_overlap(a: List[float], b: List[float]) -> float:
 
 def _is_bare_figure_label(text: str) -> bool:
     """True for ``FIGURE 8`` / ``Plate IV.`` with no descriptive prose."""
-    match = _FIGURE_NUMBER_IN_CAPTION_RE.match(text or "")
+    match = (
+        _CHAPTER_STYLE_FIGURE_NUMBER_RE.match(text or "")
+        or _FIGURE_NUMBER_IN_CAPTION_RE.match(text or "")
+    )
     if not match:
         return False
     return not (text[match.end():].strip(" \t\r\n.:;,-\u2013\u2014"))
@@ -3179,7 +3236,7 @@ def link_chunks_to_figures(
         text = ch.get("text", "") or ""
         seen_here: set = set()
         for m in _FIGURE_REF_RE.finditer(text):
-            num = m.group(1)
+            num = _reference_figure_number(m, number_to_figure_ids)
             for fid in number_to_figure_ids.get(num, []):
                 if fid in seen_here:
                     continue

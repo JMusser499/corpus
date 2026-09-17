@@ -74,6 +74,45 @@ def test_pass25_keeps_plate_numbers_distinct_from_panel_letters(tmp_path):
     assert target_32["missing_figure_crosscheck"] is True
 
 
+def test_pass25_preserves_chapter_numbers_in_plate_roi_allow_list(tmp_path):
+    image = tmp_path / "plate_4-37.png"
+    Image.new("RGB", (200, 100), "white").save(image)
+    figures_file = tmp_path / "figures.json"
+    text_file = tmp_path / "text.json"
+    figures_file.write_text(json.dumps({"figures": [
+        {
+            "figure_id": "docling_18",
+            "figure_type": "unclassified",
+            "figure_number": "4-37",
+            "caption_text": "Figure 4-37. Colony.",
+            "filename": image.name,
+            "file_path": str(image),
+        },
+        {
+            "figure_id": "docling_18_fig4-38",
+            "figure_type": "figure",
+            "figure_number": "4-38",
+            "caption_text": "Figure 4-38. Detail.",
+            "filename": image.name,
+            "file_path": str(image),
+            "caption_source": "plate_legend",
+            "shares_image_with": 18,
+        },
+    ]}), encoding="utf-8")
+    text_file.write_text(
+        json.dumps({"text": "The detail is shown in Fig. 4-38."}),
+        encoding="utf-8",
+    )
+
+    _pass25_annotate_figures(text_file, figures_file)
+
+    records = json.loads(figures_file.read_text(encoding="utf-8"))["figures"]
+    assert [
+        target["figure_number"]
+        for target in records[0]["plate_figures_from_caption"]
+    ] == ["4-37", "4-38"]
+
+
 def test_pass3a_runs_shared_plate_once_and_distributes_rois(tmp_path, monkeypatch):
     text_file, figures_file = _write_pass25_inputs(tmp_path)
     _pass25_annotate_figures(text_file, figures_file)

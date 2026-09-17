@@ -33,9 +33,12 @@ from pipeline.figures import (
     FIGURE_TYPE_PLATE,
     _LEGEND_OPENER,
     _MIN_PLATE_LEGEND_ENTRIES,
+    detect_missing_figures,
     expand_plate_figures,
     caption_figure_entries,
     dedupe_figures,
+    link_chunks_to_figures,
+    parse_figure_number,
     plate_legend_entries,
     reconcile_plate_legend_numbers,
 )
@@ -138,11 +141,73 @@ def test_comma_delimited_figure_reference_is_not_a_new_entry():
     assert [entry["figure_number"] for entry in entries] == ["77"]
 
 
-def test_numeric_range_expands_but_panel_range_does_not():
-    entries = caption_figure_entries("Fig. 58-63. Velella, panels A-C.")
+@pytest.mark.parametrize("opener", ["Fig.", "Figs."])
+def test_numeric_range_expands_but_panel_range_does_not(opener):
+    caption = f"{opener} 58-63. Velella, panels A-C."
+    entries = caption_figure_entries(caption)
     assert [e["figure_number"] for e in entries] == [
         "58", "59", "60", "61", "62", "63",
     ]
+    assert parse_figure_number(caption) == "58"
+
+
+@pytest.mark.parametrize(("caption", "expected"), [
+    ("Figure 1-11. Species account.", "1-11"),
+    ("Figure 4-37. Reconstruction of the colony.", "4-37"),
+])
+def test_singular_full_figure_chapter_number_is_one_identifier(caption, expected):
+
+    assert parse_figure_number(caption) == expected
+    assert [
+        entry["figure_number"] for entry in caption_figure_entries(caption)
+    ] == [expected]
+
+
+def test_chapter_style_legend_yields_one_logical_record_per_caption():
+    legend = [
+        {"text": "Figure 4-37. Reconstruction.", "bbox": [0, 20, 200, 30]},
+        {"text": "Figure 4-38. Detail.", "bbox": [0, 10, 200, 20]},
+    ]
+
+    entries = plate_legend_entries(legend)
+    assert [entry["figure_number"] for entry in entries] == ["4-37", "4-38"]
+
+    out = expand_plate_figures(
+        [plate(num="4-37", cap=legend[0]["text"])],
+        {17: entries},
+    )
+    assert sorted(item["figure_number"] for item in out) == ["4-37", "4-38"]
+
+
+def test_abbreviated_body_reference_prefers_existing_compound_identifier():
+    chunks = [{"chunk_id": "c1", "text": "See Fig. 4-37 for the colony."}]
+    figures = [{"figure_id": "f4-37", "figure_number": "4-37"}]
+
+    link_chunks_to_figures(chunks, figures)
+
+    assert chunks[0]["figure_refs"] == ["f4-37"]
+    assert figures[0]["referenced_in_chunks"] == ["c1"]
+    assert detect_missing_figures(chunks[0]["text"], {"4-37"}) == []
+
+
+def test_abbreviated_range_retains_first_number_without_a_compound_key():
+    chunks = [{"chunk_id": "c1", "text": "Compare Figs. 58-63."}]
+    figures = [{"figure_id": "f58", "figure_number": "58"}]
+
+    link_chunks_to_figures(chunks, figures)
+
+    assert chunks[0]["figure_refs"] == ["f58"]
+    assert figures[0]["referenced_in_chunks"] == ["c1"]
+    assert detect_missing_figures(chunks[0]["text"], {"58"}) == []
+
+
+def test_missing_reference_uses_the_document_chapter_number_namespace():
+    missing = detect_missing_figures(
+        "Figure 4-38. Detail omitted from extraction.",
+        {"4-37", "4-39"},
+    )
+
+    assert [item["figure_number"] for item in missing] == ["4-38"]
 
 
 def test_single_grouped_text_item_can_form_a_plate_legend():
