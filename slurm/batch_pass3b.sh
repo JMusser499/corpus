@@ -83,7 +83,7 @@ echo "HuggingFace cache: $HF_HOME"
 module reset
 module load miniconda/24.7.1
 eval "$(conda shell.bash hook)"
-conda activate corpus
+conda activate "$CORPUS_CONDA_ENV"
 corpus_check_checkout
 
 cd "$REPO_DIR"

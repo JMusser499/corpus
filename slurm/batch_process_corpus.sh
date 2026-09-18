@@ -68,7 +68,7 @@ source "$SCRIPT_DIR/bouchet_paths.sh"
 # YCRC's documented convention, and emits one informational line.
 module reset
 module load miniconda
-conda activate corpus
+conda activate "$CORPUS_CONDA_ENV"
 corpus_check_checkout
 
 cd "$REPO_DIR"

@@ -653,6 +653,8 @@ Optional knobs:
 | `NUM_BATCHES` | *auto* — `ceil(PDF files / BATCH_SIZE)` | Stage 1 CPU array tasks. Derived from the corpuscle's own `input_pdfs`, so you no longer have to set it; export a value only to override |
 | `BATCH_SIZE` | `64` | PDFs per Stage 1 task — see "Why `BATCH_SIZE` is 64" below |
 | `NUM_PASS3B_BATCHES` | `1` | Pass 3b GPU array tasks. Deliberately *not* tied to `NUM_BATCHES` |
+| `RUN_VISION` | `1` | Set to `0` when the reviewed figure method is `ocr` or `off`; Embed and Finalize still run |
+| `CORPUS_CONDA_ENV` | `corpus` | Conda environment activated by every phase job; override for a separately pinned corpus environment |
 | `PASS3B_BATCH_SIZE` | `256` | papers per Pass 3b task |
 | `HF_HUB_OFFLINE` | unset | `1` pins the run to the cached model snapshot; makes a build reproducible against a moving upstream (§5) |
 | `GROBID_MAX_WAIT` | `1800` (30 min) | Seconds the launcher waits for Grobid to reach RUNNING before giving up. Raise it when the queue is merely busy — check first with `sbatch --test-only slurm/batch_grobid.sh`, which prints the scheduler's estimated start. On timeout the launcher now **cancels the Grobid it submitted** rather than printing a `scancel` for you to run: it is documented as hands-off, so cleanup that needs a human watching the log is not cleanup |
@@ -661,7 +663,7 @@ Optional knobs:
 
 ### Before you launch
 
-**Run it from the login node.** `batch_pipeline.sh` submits seven jobs, polls
+**Run it from the login node.** `batch_pipeline.sh` submits the phase jobs, polls
 `squeue` and `curl` while sleeping, prints a summary and exits — it does no
 compute, and every phase runs in its own SLURM job with `afterok` dependencies,
 so nothing depends on the launcher staying alive. Under `salloc` you would hold
@@ -745,6 +747,9 @@ bash slurm/batch_pipeline.sh
 # Override the slice size (NUM_BATCHES re-derives from it automatically):
 BATCH_SIZE=128 bash slurm/batch_pipeline.sh
 
+# Retain an OCR-based figure method and use a separately reviewed environment:
+RUN_VISION=0 CORPUS_CONDA_ENV=corpus-v1.4 bash slurm/batch_pipeline.sh
+
 # Fan Pass 3b out across GPUs. Rarely needed — only for a genuinely
 # figure-bound corpus. Mind the 16-GPU per-user cap and check
 # `sinfo -p gpu_h200` first.
@@ -819,8 +824,8 @@ The orchestrator:
 1. Starts Grobid as a SLURM job, waits for it to be alive, exports `$GROBID_URL` for the extract job
 2. Submits **extract** (`batch_process_corpus.sh`) as a job array (`--array=0-N`), each task processing a deterministic slice of the sorted hash list
 3. Schedules Grobid cleanup after extract completes (runs regardless of success/failure)
-4. Queues **vision** (`batch_pass3b.sh`, GPU) and **embed** (`batch_embed.sh`, GPU) with `afterok` dependency on the full extract array
-5. Queues **finalize** (`batch_finalize.sh` — `corpus run --only post` then `--only bundle`) with `afterok` on **both** embed and vision. Both are needed: the served bundle copies `figures.json` and `figures/*.png`, which Pass 3b rewrites and Pass 3c renames, so gating on embed alone let `bundle` capture pre-vision ROIs and stale figure filenames
+4. Queues **embed** (`batch_embed.sh`, GPU) and, when `RUN_VISION=1`, **vision** (`batch_pass3b.sh`, GPU) with `afterok` dependency on the full extract array
+5. Queues **finalize** (`batch_finalize.sh` — `corpus run --only post` then `--only bundle`) with `afterok` on embed and, when enabled, vision. The vision dependency is required because Pass 3b rewrites figure artifacts that the bundle copies. With `RUN_VISION=0`, Stage 1's reviewed `ocr` or `off` figure artifacts are already final.
 6. Queues a **chain-watchdog** on `afterany` after extract, which reports the array outcome whether or not the chain survived
 
 So the orchestrator now runs the whole build, including the cross-paper DBs and served-bundle distill, hands-off. Every job invokes `corpus -c "$CORPUS_CONFIG" run --only <phase>`.

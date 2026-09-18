@@ -52,7 +52,7 @@ cd "$REPO_DIR"
 module reset
 module load miniconda
 eval "$(conda shell.bash hook)"
-conda activate corpus
+conda activate "$CORPUS_CONDA_ENV"
 corpus_check_checkout
 
 ENRICH_BHL="${ENRICH_BHL:-0}"

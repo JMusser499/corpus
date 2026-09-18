@@ -96,6 +96,12 @@ fi
 # retargeted while Stage 1 is still running.
 export CORPUS_CONFIG
 
+# Conda environment used by every phase job.  The shared reference deployment
+# keeps the historical `corpus` default; another corpuscle can pin a distinct
+# reviewed environment without copying the SLURM scripts.
+CORPUS_CONDA_ENV="${CORPUS_CONDA_ENV:-corpus}"
+export CORPUS_CONDA_ENV
+
 CACHE_DIR="${CACHE_DIR:-$BOUCHET_PROJECT/cache}"
 
 # HuggingFace cache (docling models + BGE-M3 + Qwen2.5-VL weights).
@@ -112,7 +118,8 @@ export HF_HOME="${HF_HOME:-$CACHE_DIR/huggingface}"
 # it docling/torch silently fall back to whatever the system has and
 # produce mis-structured output without crashing. Prepend the env's
 # libs so they win — matches the resolution order pip / conda used
-# at install time. Caller must `conda activate corpus` before sourcing.
+# at install time. Caller must activate the selected `$CORPUS_CONDA_ENV`
+# before sourcing.
 if [[ -n "${CONDA_PREFIX:-}" ]]; then
     export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:${LD_LIBRARY_PATH:-}"
 fi

@@ -1,7 +1,7 @@
 #!/bin/bash
 # batch_pipeline.sh — orchestrate the full corpus processing pipeline.
 #
-# Chains: Grobid server → Stage 1 → cancel Grobid → Pass 3b + Embed
+# Chains: Grobid server → Stage 1 → cancel Grobid → optional Pass 3b + Embed
 #
 # This script runs on the login node (lightweight — just sbatch + curl +
 # sleep). It auto-discovers the Grobid node, waits for the HTTP service,
@@ -19,6 +19,16 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=bouchet_paths.sh
 source "$SCRIPT_DIR/bouchet_paths.sh"
+
+# Pass 3b is a separate local-VLM method, not a mandatory pipeline stage.
+# Corpuscles whose reviewed figure method is `ocr` or `off` must be able to
+# retain that method while still using the standard extract/embed/finalize
+# chain.  Keep the reference deployment's historical behavior by default.
+RUN_VISION="${RUN_VISION:-1}"
+if [ "$RUN_VISION" != "0" ] && [ "$RUN_VISION" != "1" ]; then
+    echo "ERROR: RUN_VISION must be 0 or 1; got '$RUN_VISION'." >&2
+    exit 2
+fi
 
 CORPUS_BUILD_GIT_SHA="$(git -C "$REPO_DIR" rev-parse HEAD)"
 export CORPUS_BUILD_GIT_SHA
@@ -204,7 +214,7 @@ CANCEL_JOB=$(sbatch --parsable \
     --wrap="scancel $GROBID_JOB 2>/dev/null && echo 'Cancelled Grobid job $GROBID_JOB' || echo 'Grobid job $GROBID_JOB already finished'")
 echo "  Grobid cancel job: $CANCEL_JOB (runs after Stage 1)"
 
-# ── Step 6: Submit Pass 3b and Embed (depend on Stage 1) ────────────
+# ── Step 6: Submit optional Pass 3b and Embed (depend on Stage 1) ───
 echo ""
 # Deliberately NOT defaulted to $NUM_BATCHES. Pass 3b only sends a figure
 # to the VLM when its caption declares multiple panels
@@ -214,21 +224,26 @@ echo ""
 # (now tens of tasks) would queue against the 16-GPU per-user cap on
 # gpu_h200 for no gain. Raise it only for corpora that really are
 # figure-bound.
-NUM_PASS3B_BATCHES="${NUM_PASS3B_BATCHES:-1}"
-PASS3B_BATCH_SIZE="${PASS3B_BATCH_SIZE:-256}"
-echo "Submitting Pass 3b (vision, GPU; $NUM_PASS3B_BATCHES batch(es) of $PASS3B_BATCH_SIZE)..."
-if [ "$NUM_PASS3B_BATCHES" -gt 1 ]; then
-    PASS3B_JOB=$(sbatch --parsable \
-        --dependency=afterok:"$STAGE1_JOB" \
-        --array="0-$((NUM_PASS3B_BATCHES - 1))" \
-        --export="ALL,BATCH_SIZE=$PASS3B_BATCH_SIZE" \
-        "$SCRIPT_DIR/batch_pass3b.sh")
+PASS3B_JOB=""
+if [ "$RUN_VISION" = "1" ]; then
+    NUM_PASS3B_BATCHES="${NUM_PASS3B_BATCHES:-1}"
+    PASS3B_BATCH_SIZE="${PASS3B_BATCH_SIZE:-256}"
+    echo "Submitting Pass 3b (vision, GPU; $NUM_PASS3B_BATCHES batch(es) of $PASS3B_BATCH_SIZE)..."
+    if [ "$NUM_PASS3B_BATCHES" -gt 1 ]; then
+        PASS3B_JOB=$(sbatch --parsable \
+            --dependency=afterok:"$STAGE1_JOB" \
+            --array="0-$((NUM_PASS3B_BATCHES - 1))" \
+            --export="ALL,BATCH_SIZE=$PASS3B_BATCH_SIZE" \
+            "$SCRIPT_DIR/batch_pass3b.sh")
+    else
+        PASS3B_JOB=$(sbatch --parsable \
+            --dependency=afterok:"$STAGE1_JOB" \
+            "$SCRIPT_DIR/batch_pass3b.sh")
+    fi
+    echo "  Pass 3b job: $PASS3B_JOB"
 else
-    PASS3B_JOB=$(sbatch --parsable \
-        --dependency=afterok:"$STAGE1_JOB" \
-        "$SCRIPT_DIR/batch_pass3b.sh")
+    echo "Skipping Pass 3b (RUN_VISION=0); retaining the config's figure method."
 fi
-echo "  Pass 3b job: $PASS3B_JOB"
 
 echo "Submitting Embed (GPU)..."
 EMBED_JOB=$(sbatch --parsable --dependency=afterok:"$STAGE1_JOB" "$SCRIPT_DIR/batch_embed.sh")
@@ -237,14 +252,17 @@ echo "  Embed job: $EMBED_JOB"
 # Cross-paper finalize (#57): the four post-pipeline builds plus the
 # served-bundle distill.
 #
-# Depends on Pass 3b as well as Embed. Those two are siblings, so gating
-# only on Embed let `bundle` start while Pass 3b was still rewriting
-# figures.json and Pass 3c was still renaming split-panel PNGs — both of
-# which mcpsrv/bundle.py copies into corpus_bundle/. The bundle could therefore
-# capture pre-vision ROIs and stale figure filenames.
+# When Pass 3b runs, finalize depends on it as well as Embed. Those two are
+# siblings, so gating only on Embed let `bundle` capture figures while vision
+# was still rewriting them. With RUN_VISION=0, Embed is the only sibling and
+# the config's Stage 1 figure artifacts are already final.
 echo "Submitting Finalize (cross-paper tail)..."
+FINALIZE_DEPENDENCY="afterok:$EMBED_JOB"
+if [ -n "$PASS3B_JOB" ]; then
+    FINALIZE_DEPENDENCY="$FINALIZE_DEPENDENCY:$PASS3B_JOB"
+fi
 FINALIZE_JOB=$(sbatch --parsable \
-    --dependency=afterok:"$EMBED_JOB":"$PASS3B_JOB" \
+    --dependency="$FINALIZE_DEPENDENCY" \
     "$SCRIPT_DIR/batch_finalize.sh")
 echo "  Finalize job: $FINALIZE_JOB"
 
@@ -268,8 +286,8 @@ echo \"Documents complete: \$n_done\"
 if sacct -j $STAGE1_JOB -n -o State%20 | grep -qvE 'COMPLETED|^[[:space:]]*\$'; then
     echo
     echo '*** WARNING: at least one Stage 1 task did not COMPLETE. ***'
-    echo '*** afterok was not satisfied, so Pass 3b ($PASS3B_JOB), Embed ($EMBED_JOB)'
-    echo '*** and Finalize ($FINALIZE_JOB) have been CANCELLED by SLURM.'
+    echo '*** afterok was not satisfied, so downstream jobs were cancelled:'
+    echo '*** Pass 3b (${PASS3B_JOB:-disabled}), Embed ($EMBED_JOB), Finalize ($FINALIZE_JOB).'
     echo '*** Resume is implicit — resubmit with: bash slurm/batch_pipeline.sh'
 else
     echo 'Stage 1 fully COMPLETED; downstream chain is live.'
@@ -283,9 +301,13 @@ echo ""
 printf "  %-20s %s\n" "Grobid server:" "$GROBID_JOB (running on $GROBID_NODE)"
 printf "  %-20s %s\n" "Stage 1:" "$STAGE1_JOB (running now)"
 printf "  %-20s %s\n" "Grobid cancel:" "$CANCEL_JOB (after Stage 1)"
-printf "  %-20s %s\n" "Pass 3b:" "$PASS3B_JOB (after Stage 1)"
+if [ -n "$PASS3B_JOB" ]; then
+    printf "  %-20s %s\n" "Pass 3b:" "$PASS3B_JOB (after Stage 1)"
+else
+    printf "  %-20s %s\n" "Pass 3b:" "disabled (RUN_VISION=0)"
+fi
 printf "  %-20s %s\n" "Embed:" "$EMBED_JOB (after Stage 1)"
-printf "  %-20s %s\n" "Finalize:" "$FINALIZE_JOB (after Embed + Pass 3b; #57)"
+printf "  %-20s %s\n" "Finalize:" "$FINALIZE_JOB ($FINALIZE_DEPENDENCY; #57)"
 printf "  %-20s %s\n" "Chain watchdog:" "$WATCHDOG_JOB (after Stage 1, always)"
 echo ""
 
@@ -297,7 +319,11 @@ echo ""
 echo "=== Dependency check ==="
 squeue --me -o "%.12i %.18j %.10T %.30E" || true
 echo ""
-for _j in "$PASS3B_JOB" "$EMBED_JOB" "$FINALIZE_JOB"; do
+DEPENDENT_JOBS=("$EMBED_JOB" "$FINALIZE_JOB")
+if [ -n "$PASS3B_JOB" ]; then
+    DEPENDENT_JOBS=("$PASS3B_JOB" "${DEPENDENT_JOBS[@]}")
+fi
+for _j in "${DEPENDENT_JOBS[@]}"; do
     if ! squeue -j "$_j" -h -o "%i" >/dev/null 2>&1; then
         echo "WARNING: job $_j is not in the queue — it was never accepted." >&2
     fi
@@ -305,4 +331,8 @@ done
 
 echo "Monitor: squeue --me"
 echo "Watchdog log: $REPO_DIR/logs/slurm-watchdog-$WATCHDOG_JOB.out"
-echo "Cancel all: scancel $GROBID_JOB $STAGE1_JOB $CANCEL_JOB $PASS3B_JOB $EMBED_JOB $FINALIZE_JOB $WATCHDOG_JOB"
+CANCEL_JOBS=("$GROBID_JOB" "$STAGE1_JOB" "$CANCEL_JOB" "$EMBED_JOB" "$FINALIZE_JOB" "$WATCHDOG_JOB")
+if [ -n "$PASS3B_JOB" ]; then
+    CANCEL_JOBS+=("$PASS3B_JOB")
+fi
+echo "Cancel all: scancel ${CANCEL_JOBS[*]}"

@@ -73,7 +73,7 @@ echo "HuggingFace cache: $HF_HOME"
 # YCRC's documented convention, and emits one informational line.
 module reset
 module load miniconda CUDA
-conda activate corpus
+conda activate "$CORPUS_CONDA_ENV"
 corpus_check_checkout
 
 cd "$REPO_DIR"
