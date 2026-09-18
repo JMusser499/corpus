@@ -391,6 +391,16 @@ _FIGURE_MENTION_RE = re.compile(
     re.IGNORECASE,
 )
 
+# A tight attribution immediately before a label marks a figure belonging to
+# the cited source rather than to the document being extracted. Keep this
+# deliberately narrower than general citation language: suppressing a real
+# local caption would be worse than retaining an uncertain QC candidate.
+_OTHER_WORK_FIGURE_CONTEXT_RE = re.compile(
+    r"\b(?:in|from)\s+(?:that|this|the)\s+"
+    r"(?:publication|paper|work|book)\s*$",
+    re.IGNORECASE,
+)
+
 
 def _reference_figure_number(match, known_numbers) -> str:
     """Resolve an ambiguous ``Fig. A-B`` mention against known identities.
@@ -466,13 +476,15 @@ def detect_missing_figures(text: str, extracted_numbers) -> List[Dict]:
     ``extracted_numbers`` may be any iterable of strings or ints — they're
     normalised to strings for the set comparison.
 
-    Two heuristic filters eliminate the common false-positive classes:
+    Three heuristic filters eliminate the common false-positive classes:
 
     1. **Cross-reference shape** — if every occurrence of ``Fig. N`` in
        the running text is immediately followed by ``)`` (the closing
        paren of a body-text citation like ``(Fig. N)``), the number is
        probably just a cross-ref and not a missing caption.
-    2. **Out-of-range** — references to figures from *other* papers
+    2. **Explicit other-work attribution** — ``in that publication Plate 4``
+       names a plate in the cited source, not a missing local plate.
+    3. **Out-of-range** — references to figures from *other* papers
        (Totton 1965's Fig. 70, Lens & van Riemsdijk's Fig. 89) will use
        figure numbers much larger than the paper's own range. We drop
        any number whose integer value is more than twice the largest
@@ -484,10 +496,10 @@ def detect_missing_figures(text: str, extracted_numbers) -> List[Dict]:
 
     # Collect all mentions with their character positions so filters can
     # inspect context.
-    mentions_by_num: Dict[str, List[int]] = {}
+    mentions_by_num: Dict[str, List[Tuple[int, int]]] = {}
     for m in _FIGURE_MENTION_RE.finditer(text):
         number = _reference_figure_number(m, extracted)
-        mentions_by_num.setdefault(number, []).append(m.end())
+        mentions_by_num.setdefault(number, []).append((m.start(), m.end()))
 
     missing = set(mentions_by_num) - extracted
     if not missing:
@@ -505,22 +517,31 @@ def detect_missing_figures(text: str, extracted_numbers) -> List[Dict]:
         if out_of_range_cutoff is not None and num.isdigit():
             if int(num) > out_of_range_cutoff:
                 continue
-        ends = mentions_by_num[num]
-        # Shape filter: if EVERY occurrence is followed within a few chars
-        # by a closing paren, treat as cross-ref only.
+        positions = mentions_by_num[num]
+        # Shape filter: if EVERY occurrence is either followed within a few
+        # chars by a closing paren or explicitly attributed to another work,
+        # treat the number as cross-reference-only.
         def is_crossref(end_pos: int) -> bool:
             window = text[end_pos : end_pos + 8]
             # Allow a panel-letter suffix like 'A)' between the number and
             # the ')': "Fig. 10A, B)" should still count as cross-ref.
             return bool(re.match(r"[A-Z]?[,\s\-\u2013A-Z]*\)", window))
-        if ends and all(is_crossref(p) for p in ends):
+
+        def is_other_work(start_pos: int) -> bool:
+            before = text[max(0, start_pos - 80) : start_pos]
+            return bool(_OTHER_WORK_FIGURE_CONTEXT_RE.search(before))
+
+        if positions and all(
+            is_crossref(end) or is_other_work(start)
+            for start, end in positions
+        ):
             continue
 
         out.append({
             "figure_number": num,
             "caption_text_candidate": _extract_caption_candidate_for_number(text, num),
             "detection_reason": "mentioned_in_text_but_no_extracted_figure",
-            "mention_count": len(ends),
+            "mention_count": len(positions),
         })
     return out
 
@@ -3659,12 +3680,11 @@ def cap_scale_to_pixels(rect_w: float, rect_h: float, scale: float, cap):
     Returns ``(scale, capped)``. ``cap`` of ``None`` or a figure already
     inside it returns the scale unchanged.
 
-    The bound is the cap within a pixel or two, not to the pixel:
-    PyMuPDF sizes a pixmap from the integer rect of the transformed
-    clip, which does not depend only on ``rect * scale``, so a figure
-    capped to 3000 can come back 3001. Aiming half a pixel under the cap
-    narrows that without pretending to eliminate it, and the difference
-    is 0.03% of the figure — the saving this exists for is 45%.
+    PyMuPDF rounds both transformed clip edges outward to integer pixels,
+    so the pixmap can be almost two pixels larger than ``rect * scale``.
+    Aim two pixels below the configured ceiling to make the saved integer
+    dimensions honor that ceiling exactly. The difference is 0.07% at the
+    3000-pixel default.
 
     A *pixel* ceiling, not a DPI one, and the two are not
     interchangeable (#184). Measured on the 1,775-document reference
@@ -3687,7 +3707,8 @@ def cap_scale_to_pixels(rect_w: float, rect_h: float, scale: float, cap):
     longest = max(rect_w, rect_h) * scale
     if longest <= cap:
         return scale, False
-    return scale * ((cap - 0.5) / longest), True
+    target = max(1, cap - 2)
+    return scale * (target / longest), True
 
 
 def native_render_scale(doc, page, rect, vector_dpi: float, max_dpi):

@@ -210,6 +210,27 @@ def test_missing_reference_uses_the_document_chapter_number_namespace():
     assert [item["figure_number"] for item in missing] == ["4-38"]
 
 
+def test_other_publication_plate_reference_is_not_a_missing_local_figure():
+    """A cited book's plate is evidence about that book, not this one."""
+    text = (
+        "Bergquist (1978) pictures a microsclerocyte (see in that publication "
+        "Plate 4, Fig. a). The present structure appears in Fig. 4-20C."
+    )
+
+    assert detect_missing_figures(text, {"4-20", "4-37"}) == []
+
+
+def test_other_work_filter_does_not_hide_a_real_local_caption():
+    text = (
+        "Compare in that publication Plate 4. "
+        "Figure 4. Local plate omitted from extraction."
+    )
+
+    missing = detect_missing_figures(text, {"1", "2"})
+
+    assert [item["figure_number"] for item in missing] == ["4"]
+
+
 def test_single_grouped_text_item_can_form_a_plate_legend():
     entries = plate_legend_entries([{
         "text": "Fig. 10. Colony. Fig. 11. Eudoxid. Fig. 12. Gonophore.",

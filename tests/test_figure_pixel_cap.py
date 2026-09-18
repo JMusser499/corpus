@@ -62,6 +62,27 @@ def test_the_cap_scales_the_whole_figure_not_just_one_axis():
     assert pytest.approx(2000 * scale / (1000 * scale), rel=1e-9) == 2.0
 
 
+def test_the_native_render_never_rounds_one_pixel_over_the_cap():
+    """PyMuPDF rounds both transformed clip edges to integer pixels.
+
+    This measured fractional rectangle used to produce a 3001-pixel side
+    even though the requested render scale targeted 2999.5 pixels.
+    """
+    import fitz
+
+    doc = fitz.open()
+    page = doc.new_page(width=700, height=900)
+    rect = fitz.Rect(0.1, 0.1, 312.4, 412.7)
+    scale, capped = cap_scale_to_pixels(
+        rect.width, rect.height, 12.0, 3000,
+    )
+    pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), clip=rect)
+
+    assert capped is True
+    assert max(pix.width, pix.height) <= 3000
+    doc.close()
+
+
 # --- the PIL path (fixed mode / the docling save) -----------------------
 
 
