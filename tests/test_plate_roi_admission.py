@@ -195,6 +195,63 @@ def test_vision_numeric_targets_use_embedded_figure_regions(tmp_path):
     assert [roi["label"] for roi in result["rois"]] == ["31", "32"]
 
 
+def test_vision_panel_targets_recover_misclassified_labels_and_drop_fake_label_box(
+    tmp_path,
+):
+    """Normalize two observed, unambiguous local-Qwen response defects."""
+    image = tmp_path / "compound.png"
+    Image.new("RGB", (200, 100), "white").save(image)
+
+    class Backend:
+        name = "vision:test"
+
+        @staticmethod
+        def detect_figure_panels(_path, _caption, labels):
+            assert labels == ["A", "B", "C"]
+            return [
+                {
+                    "type": "panel",
+                    "label": "A",
+                    "bbox_px": [0, 0, 60, 100],
+                    # A label-localization box cannot be the whole panel.
+                    "label_bbox_px": [0, 0, 60, 100],
+                    "source": "vision:test",
+                },
+                {
+                    "type": "panel",
+                    "label": "B",
+                    "bbox_px": [60, 0, 120, 100],
+                    "label_bbox_px": [62, 2, 68, 10],
+                    "source": "vision:test",
+                },
+                {
+                    # Qwen occasionally puts a requested panel letter in the
+                    # embedded-figure collection. The caption allow-list makes
+                    # this label safe to recover as a panel.
+                    "type": "embedded_figure",
+                    "figure_number": "c",
+                    "bbox_px": [120, 0, 200, 100],
+                    "source": "vision:test",
+                },
+            ]
+
+    result = detect_figure_rois_via_vision(
+        image,
+        [{"label": "A"}, {"label": "B"}, {"label": "C"}],
+        Backend(),
+        target_kind="panel",
+    )
+
+    assert result["pass3_status"] == "completed"
+    assert [(roi["type"], roi["label"]) for roi in result["rois"]] == [
+        ("panel", "A"),
+        ("panel", "B"),
+        ("panel", "C"),
+    ]
+    assert "label_bbox_px" not in result["rois"][0]
+    assert result["rois"][1]["label_bbox_px"] == [62, 2, 68, 10]
+
+
 def test_bare_plate_discovery_keeps_only_distinct_high_confidence_numbers(tmp_path):
     image = tmp_path / "plate_xvi.png"
     Image.new("RGB", (300, 200), "white").save(image)

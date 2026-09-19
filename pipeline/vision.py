@@ -358,6 +358,26 @@ def _bbox_to_px(bbox, w: int, h: int):
     return [x0, y0, x1, y1], units
 
 
+def _rescale_bbox_px(
+    bbox: List[int],
+    source_w: int,
+    source_h: int,
+    target_w: int,
+    target_h: int,
+) -> List[int]:
+    """Map a valid pixel bbox between two aspect-matched image canvases."""
+    if (source_w, source_h) == (target_w, target_h):
+        return list(bbox)
+    scale_x = target_w / source_w
+    scale_y = target_h / source_h
+    return [
+        int(round(bbox[0] * scale_x)),
+        int(round(bbox[1] * scale_y)),
+        int(round(bbox[2] * scale_x)),
+        int(round(bbox[3] * scale_y)),
+    ]
+
+
 def _log_bbox_dispositions(counts, name: str, backend: str) -> None:
     """Say what the model emitted and what it cost, once per figure.
 
@@ -591,7 +611,21 @@ _LOCAL_VLM_VARIANTS = {
 # Qwen2.5-VL chat prompt.  Qwen's vision-language models respond to
 # ``<|im_start|>system`` / ``<|im_start|>user`` templates automatically
 # when run through the HuggingFace transformers chat pipeline.
-_LOCAL_SYSTEM_PROMPT = _CLAUDE_SYSTEM_PROMPT  # identical task spec
+_LOCAL_SYSTEM_PROMPT = (
+    _CLAUDE_SYSTEM_PROMPT
+    .replace("panel_bbox_norm", "panel_bbox_px")
+    .replace("label_bbox_norm", "label_bbox_px")
+    .replace(
+        "Coordinate rules:\n"
+        "- All bboxes are [left, top, right, bottom] in NORMALIZED image coordinates\n"
+        "  (each coordinate is a float in 0.0 .. 1.0). Top-left origin (PIL convention,\n"
+        "  y grows downward).\n",
+        "Coordinate rules:\n"
+        "- All bboxes are [left, top, right, bottom] in ABSOLUTE PIXEL coordinates\n"
+        "  on the resized image whose exact dimensions appear in the user message.\n"
+        "  Top-left origin (PIL convention, y grows downward).\n",
+    )
+)
 
 
 # Weight dtypes the local VLM may load in, and what each costs for a 7B
@@ -801,10 +835,19 @@ class LocalVLMBackend(VisionBackend):
 
         The configured ``max_new_tokens`` is the floor, so a caller that
         raised it keeps what they asked for and small figures are unaffected.
-        A bare-plate discovery request has no caption-derived count to scale
-        by, so the shared helper supplies its conservative discovery floor.
+        Bare-plate discovery, panel-rich figures, and grouped figures receive
+        the conservative discovery floor: their caption-derived list is not a
+        reliable upper bound on how many visible regions Qwen may return.
         """
-        return _vision_token_budget(self._max_new_tokens, expected_labels)
+        budget = _vision_token_budget(self._max_new_tokens, expected_labels)
+        labels = list(expected_labels or [])
+        grouped_figure_numbers = (
+            len(labels) >= 2
+            and all(str(label).strip().isdigit() for label in labels)
+        )
+        if len(labels) >= 10 or grouped_figure_numbers:
+            budget = max(budget, _VLM_DISCOVERY_TOKEN_FLOOR)
+        return budget
 
     @staticmethod
     def _probe_device() -> str:
@@ -840,22 +883,41 @@ class LocalVLMBackend(VisionBackend):
                 f"could not read image {image_path}: {e}"
             ) from e
 
-        user_text = _vision_user_text(caption_text, expected_labels, w, h)
-
+        # Qwen2.5-VL grounds objects in absolute pixels on the image canvas
+        # that reaches the model, not on the saved original. Carry the same
+        # pixel budget into qwen-vl-utils so it performs that resize once,
+        # then tell the model the resulting dimensions. The prior path put
+        # the original dimensions in the prompt while AutoProcessor silently
+        # supplied a smaller canvas, making many valid-looking coordinates
+        # land in the wrong place on the original figure.
+        image_item = {
+            "type": "image",
+            "image": img,
+            "min_pixels": self._min_pixels,
+            "max_pixels": self._max_pixels,
+        }
         messages = [
             {"role": "system", "content": _LOCAL_SYSTEM_PROMPT},
             {"role": "user", "content": [
-                {"type": "image", "image": img},
-                {"type": "text", "text": user_text},
+                image_item,
+                {"type": "text", "text": ""},
             ]},
         ]
 
         try:
+            from qwen_vl_utils import process_vision_info
+            image_inputs, video_inputs = process_vision_info(messages)
+            if not image_inputs or len(image_inputs) != 1:
+                raise ValueError(
+                    f"expected one processed image, got {len(image_inputs or [])}"
+                )
+            model_w, model_h = image_inputs[0].size
+            messages[1]["content"][1]["text"] = _vision_user_text(
+                caption_text, expected_labels, model_w, model_h,
+            )
             text_prompt = self._processor.apply_chat_template(
                 messages, tokenize=False, add_generation_prompt=True,
             )
-            from qwen_vl_utils import process_vision_info
-            image_inputs, video_inputs = process_vision_info(messages)
             inputs = self._processor(
                 text=[text_prompt],
                 images=image_inputs,
@@ -914,23 +976,29 @@ class LocalVLMBackend(VisionBackend):
             )
             break
 
-        # Convert normalized bboxes to pixel coordinates — same logic as
-        # the Claude backend.
-        # One shared converter for both backends (#253). It was duplicated
-        # here and in the local-VLM path, so the pixel-coordinate defect had
-        # to be found and fixed twice.
+        # Qwen coordinates belong to the resized model canvas. Convert there
+        # first, then project the result onto the saved original image so the
+        # public backend contract remains original-image pixels.
         bbox_counts: Counter = Counter()
 
-        def _norm_to_px(bbox_norm):
-            px, disposition = _bbox_to_px(bbox_norm, w, h)
-            if bbox_norm is not None:
+        def _model_to_original_px(bbox_model):
+            px, disposition = _bbox_to_px(bbox_model, model_w, model_h)
+            if bbox_model is not None:
                 bbox_counts[disposition] += 1
-            return px
+            if px is None:
+                return None
+            return _rescale_bbox_px(px, model_w, model_h, w, h)
+
+        def _response_bbox(item, stem):
+            # The local prompt now names the values honestly as pixels. Keep
+            # the old key as an input-only fallback for model responses that
+            # imitate examples from an earlier prompt revision.
+            return item.get(f"{stem}_px", item.get(f"{stem}_norm"))
 
         out: List[Dict] = []
         src = self.name
         for p in parsed.get("panels") or []:
-            panel_px = _norm_to_px(p.get("panel_bbox_norm"))
+            panel_px = _model_to_original_px(_response_bbox(p, "panel_bbox"))
             if panel_px is None:
                 continue
             entry = {
@@ -942,12 +1010,12 @@ class LocalVLMBackend(VisionBackend):
                 "description": (p.get("description") or "").strip(),
                 "source": src,
             }
-            label_px = _norm_to_px(p.get("label_bbox_norm"))
+            label_px = _model_to_original_px(_response_bbox(p, "label_bbox"))
             if label_px is not None:
                 entry["label_bbox_px"] = label_px
             out.append(entry)
         for f in parsed.get("embedded_figures") or []:
-            panel_px = _norm_to_px(f.get("panel_bbox_norm"))
+            panel_px = _model_to_original_px(_response_bbox(f, "panel_bbox"))
             if panel_px is None:
                 continue
             out.append({

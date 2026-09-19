@@ -2618,10 +2618,19 @@ def detect_figure_rois_via_vision(
 
     # Normalize to the figures.json rois schema. Panels carry the whole-
     # panel bbox as roi_px; label_bbox_px is added if the backend gave
-    # us a separate letter-level bbox. Embedded-figure entries become
-    # type=figure with a figure_number.
+    # us a separate letter-level bbox. Embedded-figure entries normally
+    # become type=figure with a figure_number; a caption-listed panel letter
+    # is recovered as a panel below.
     out: List[Dict] = []
     for r in backend_rois:
+        region = r.get("bbox_px")
+        label_region = r.get("label_bbox_px")
+        # A box identical to the whole panel cannot locate its label. Local
+        # Qwen sometimes copies the panel box into both fields; retaining it
+        # would turn an explicit model failure into false label evidence.
+        distinct_label_region = (
+            label_region if label_region and label_region != region else None
+        )
         if r["type"] == "panel":
             label = str(r.get("label", ""))
             # Some models put visible plate numbers in ``panels`` rather than
@@ -2635,30 +2644,48 @@ def detect_figure_rois_via_vision(
                     "type": "figure",
                     "label": label,
                     "figure_number": label,
-                    "roi_px": r.get("bbox_px"),
+                    "roi_px": region,
                     "source": r.get("source") or backend.name,
                     "confidence": r.get("confidence"),
                     "description_from_vision": r.get("description", ""),
                 }
-                if r.get("label_bbox_px"):
-                    entry["label_bbox_px"] = r["label_bbox_px"]
+                if distinct_label_region:
+                    entry["label_bbox_px"] = distinct_label_region
                 out.append(entry)
                 continue
             entry = {
                 "type": "panel",
                 "label": label,
-                "roi_px": r.get("bbox_px"),
+                "roi_px": region,
                 "source": r.get("source") or backend.name,
                 "confidence": r.get("confidence"),
                 "description_from_vision": r.get("description", ""),
             }
             if r.get("parent_figure_index") is not None:
                 entry["parent_figure_index"] = r["parent_figure_index"]
-            if r.get("label_bbox_px"):
-                entry["label_bbox_px"] = r["label_bbox_px"]
+            if distinct_label_region:
+                entry["label_bbox_px"] = distinct_label_region
             out.append(entry)
         elif r["type"] == "embedded_figure":
             figure_number = str(r.get("figure_number") or "").strip()
+            # Qwen occasionally emits a requested panel letter in the
+            # embedded-figure collection. Recover it only when the caption's
+            # explicit allow-list identifies the same panel label.
+            if target_kind == "panel" and figure_number:
+                panel_label = expected_casefold.get(figure_number.casefold())
+                if panel_label is not None:
+                    entry = {
+                        "type": "panel",
+                        "label": panel_label,
+                        "roi_px": region,
+                        "source": r.get("source") or backend.name,
+                        "confidence": r.get("confidence"),
+                        "description_from_vision": r.get("description", ""),
+                    }
+                    if r.get("parent_figure_index") is not None:
+                        entry["parent_figure_index"] = r["parent_figure_index"]
+                    out.append(entry)
+                    continue
             if target_kind == "figure" and figure_number:
                 figure_number = expected_casefold.get(
                     figure_number.casefold(), figure_number,
@@ -2667,7 +2694,7 @@ def detect_figure_rois_via_vision(
                 "type": "figure",
                 "figure_number": figure_number or None,
                 "parent_figure_index": r.get("parent_figure_index"),
-                "roi_px": r.get("bbox_px"),
+                "roi_px": region,
                 "source": r.get("source") or backend.name,
                 "confidence": r.get("confidence"),
             }

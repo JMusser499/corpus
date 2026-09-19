@@ -29,7 +29,6 @@ from pipeline.figure_passes import _pass3b_annotate_rois
 from pipeline.figures import detect_figure_rois_via_vision
 from pipeline.vision import (
     ClaudeVisionBackend,
-    _VLM_TOKEN_BASE,
     _VLM_TOKENS_PER_PANEL,
     LocalVLMBackend,
     VisionBackendError,
@@ -138,6 +137,20 @@ def test_discovery_with_no_expected_labels_gets_a_conservative_budget():
     b = _Budget(1024)
     assert b._token_budget([]) == 4096
     assert b._token_budget(None) == 4096
+
+
+def test_local_panel_rich_figures_get_the_discovery_sized_floor():
+    """The Sponge pilot exhausted both attempts on 11-12-caption-label
+    plates because the image visibly contained many additional labels."""
+    b = _Budget(1024)
+    assert b._token_budget([chr(ord("A") + i) for i in range(10)]) >= 4096
+
+
+def test_local_grouped_figures_get_the_discovery_sized_floor():
+    """A two-figure compound can contain dozens of panels despite having
+    only two caption-derived figure numbers."""
+    b = _Budget(1024)
+    assert b._token_budget(["4", "5"]) >= 4096
 
 
 def test_the_budget_grows_with_panels():

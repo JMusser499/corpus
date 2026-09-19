@@ -20,6 +20,8 @@ guessing, and repairing strictly dominates dropping.
 """
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from pipeline.vision import (
@@ -109,9 +111,10 @@ def test_both_backends_use_the_shared_converter():
     from pipeline import vision
     src = inspect.getsource(vision)
     assert src.count("def _bbox_to_px") == 1
-    assert src.count("_bbox_to_px(bbox_norm, w, h)") == 2, (
-        "each backend should delegate to the shared converter"
-    )
+    claude_src = inspect.getsource(vision.ClaudeVisionBackend.detect_figure_panels)
+    local_src = inspect.getsource(vision.LocalVLMBackend.detect_figure_panels)
+    assert "_bbox_to_px(bbox_norm, w, h)" in claude_src
+    assert "_bbox_to_px(bbox_model, model_w, model_h)" in local_src
 
 
 def test_the_dispositions_are_counted_for_the_log():
@@ -121,6 +124,90 @@ def test_the_dispositions_are_counted_for_the_log():
     from pipeline import vision
     src = inspect.getsource(vision)
     assert src.count("_log_bbox_dispositions(bbox_counts") == 2
+
+
+def test_local_qwen_uses_one_resized_coordinate_frame(tmp_path, monkeypatch):
+    """Qwen2.5-VL emits absolute coordinates on the resized model image.
+
+    The backend used to put the original dimensions in the prompt, let
+    ``process_vision_info`` and the processor resize independently, and then
+    interpreted the answer on the original canvas.  Exercise the real backend
+    method with only model inference stubbed: the resize budget must travel
+    with the image, the prompt must name the resulting canvas, and the emitted
+    boxes must be mapped back to the saved original image.
+    """
+    import torch
+    from PIL import Image
+    import qwen_vl_utils
+    from pipeline.vision import LocalVLMBackend
+
+    image_path = tmp_path / "compound.png"
+    Image.new("RGB", (200, 100), "white").save(image_path)
+    observed = {}
+
+    def process_vision_info(messages):
+        image_item = messages[1]["content"][0]
+        observed["image_item"] = image_item
+        return [image_item["image"].resize((100, 50))], None
+
+    monkeypatch.setattr(qwen_vl_utils, "process_vision_info", process_vision_info)
+
+    response = """{"panels": [{
+      "label": "A", "parent_figure_index": 0,
+      "panel_bbox_px": [10, 5, 90, 45],
+      "label_bbox_px": [10, 5, 20, 15],
+      "confidence": 1.0, "description": "panel"
+    }], "embedded_figures": []}"""
+
+    class Inputs(dict):
+        def __init__(self):
+            self.input_ids = torch.tensor([[11, 12]])
+            super().__init__(input_ids=self.input_ids)
+
+        def to(self, _device):
+            return self
+
+    class Processor:
+        def apply_chat_template(self, messages, **_kwargs):
+            observed["messages"] = messages
+            return "prompt"
+
+        def __call__(self, **kwargs):
+            observed["processor_image_size"] = kwargs["images"][0].size
+            return Inputs()
+
+        def batch_decode(self, _generated, **_kwargs):
+            return [response]
+
+    class Model:
+        device = "cpu"
+        config = SimpleNamespace(_commit_hash="test")
+
+        def generate(self, **_kwargs):
+            return torch.tensor([[11, 12, 13]])
+
+    backend = object.__new__(LocalVLMBackend)
+    backend._processor = Processor()
+    backend._model = Model()
+    backend._model_id = "Qwen/Qwen2.5-VL-7B-Instruct"
+    backend._max_new_tokens = 1024
+    backend._min_pixels = 3136
+    backend._max_pixels = 1003520
+
+    rois = backend.detect_figure_panels(image_path, "(A) panel", ["A"])
+
+    image_item = observed["image_item"]
+    assert image_item["min_pixels"] == 3136
+    assert image_item["max_pixels"] == 1003520
+    assert observed["processor_image_size"] == (100, 50)
+    system_text = observed["messages"][0]["content"]
+    assert "ABSOLUTE PIXEL coordinates" in system_text
+    assert "NORMALIZED image coordinates" not in system_text
+    user_text = observed["messages"][1]["content"][1]["text"]
+    assert "100 × 50" in user_text
+    assert "200 × 100" not in user_text
+    assert rois[0]["bbox_px"] == [20, 10, 180, 90]
+    assert rois[0]["label_bbox_px"] == [20, 10, 40, 30]
 
 
 # --- end to end: the real response shape through a real backend ---------------
