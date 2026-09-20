@@ -1,9 +1,10 @@
-"""Model bboxes arrive as pixels, not the 0–1 floats the prompt demands (#253).
+"""Model bbox coordinate handling across Claude and local Qwen (#253/#305).
 
-Both backends multiplied by the image dimensions on the prompt's assurance
-that "each coordinate is a float in 0.0 .. 1.0". Qwen2.5-VL frequently
-ignores it: 130 of 142 observable responses on one cluster carried absolute
-pixels, and 100% of them since 2026-05-30.
+Claude requests normalized coordinates. Qwen used to do the same but frequently
+returned pixels: 130 of 142 observable responses on one cluster carried
+absolute pixels, and 100% of them since 2026-05-30. Qwen now requests pixels on
+an explicitly sized model canvas; both paths still accept either representation
+and return original-image pixels.
 
 The old conversion turned that into loss two different ways, neither logged:
 
@@ -31,6 +32,7 @@ from pipeline.vision import (
     _BBOX_OUT_OF_RANGE,
     _BBOX_PIXELS,
     _bbox_to_px,
+    _log_bbox_dispositions,
     VisionBackendError,
 )
 
@@ -122,8 +124,44 @@ def test_the_dispositions_are_counted_for_the_log():
     could only be answered from responses that failed to parse."""
     import inspect
     from pipeline import vision
-    src = inspect.getsource(vision)
-    assert src.count("_log_bbox_dispositions(bbox_counts") == 2
+    claude_src = inspect.getsource(vision.ClaudeVisionBackend.detect_figure_panels)
+    local_src = inspect.getsource(vision.LocalVLMBackend.detect_figure_panels)
+    assert "_log_bbox_dispositions(" in claude_src
+    assert "_log_bbox_dispositions(" in local_src
+    assert "expected_units=_BBOX_PIXELS" in local_src
+
+
+def test_expected_qwen_pixel_boxes_do_not_emit_a_conversion_message(caplog):
+    _log_bbox_dispositions(
+        {_BBOX_PIXELS: 4},
+        "figure.png",
+        "vision:qwen",
+        expected_units=_BBOX_PIXELS,
+    )
+    assert not caplog.records
+
+
+def test_normalized_qwen_fallback_is_reported_honestly(caplog):
+    with caplog.at_level("INFO"):
+        _log_bbox_dispositions(
+            {_BBOX_NORMALIZED: 2, _BBOX_PIXELS: 3},
+            "figure.png",
+            "vision:qwen",
+            expected_units=_BBOX_PIXELS,
+        )
+    assert "arrived as normalized rather than the pixels coordinates" in caplog.text
+    assert "3 pixels" in caplog.text
+
+
+def test_pixel_claude_fallback_is_reported_honestly(caplog):
+    with caplog.at_level("INFO"):
+        _log_bbox_dispositions(
+            {_BBOX_PIXELS: 2, _BBOX_NORMALIZED: 3},
+            "figure.png",
+            "vision:claude",
+        )
+    assert "arrived as pixels rather than the normalized coordinates" in caplog.text
+    assert "3 normalized" in caplog.text
 
 
 def test_local_qwen_uses_one_resized_coordinate_frame(tmp_path, monkeypatch):

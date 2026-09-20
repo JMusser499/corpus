@@ -17,8 +17,10 @@ Backend abstraction mirrors ``pipeline.embeddings``:
   independent. The right choice for the Bouchet production run.
 
 Both backends return the same structured output — a list of panel /
-embedded-figure ROIs with normalized bboxes + per-ROI confidence — so
-the Pass 3b pipeline step is backend-agnostic.
+embedded-figure ROIs in original-image pixel coordinates, plus per-ROI
+confidence — so the Pass 3b pipeline step is backend-agnostic. Claude is
+prompted for normalized coordinates; Qwen is prompted for pixels on its
+explicitly sized model canvas and those pixels are rescaled to the original.
 """
 
 from __future__ import annotations
@@ -296,11 +298,12 @@ def _parse_complete_vision_response(
 # Model bboxes → pixels (#253)
 # ---------------------------------------------------------------------------
 
-# What units did the model actually emit? The prompt demands "each coordinate
-# is a float in 0.0 .. 1.0", and both backends multiplied by the image
-# dimensions on that assumption. Qwen2.5-VL frequently ignores it and emits
-# absolute pixels instead — measured at 130 of 142 observable responses on
-# one cluster, and 100% of those since 2026-05-30.
+# What units did the model actually emit? Claude is prompted for normalized
+# coordinates. Qwen used to receive the same prompt, but frequently ignored
+# it and emitted absolute pixels instead — measured at 130 of 142 observable
+# responses on one cluster, and 100% of those since 2026-05-30. Qwen is now
+# prompted for pixels on its explicitly sized model canvas; the shared parser
+# still accepts either representation because model output is not guaranteed.
 #
 # The old conversion turned that into silent loss, two different ways:
 #
@@ -378,24 +381,34 @@ def _rescale_bbox_px(
     ]
 
 
-def _log_bbox_dispositions(counts, name: str, backend: str) -> None:
+def _log_bbox_dispositions(
+    counts,
+    name: str,
+    backend: str,
+    expected_units: str = _BBOX_NORMALIZED,
+) -> None:
     """Say what the model emitted and what it cost, once per figure.
 
     The drop paths had no logging at all, which is why the units question
     could only be answered from the handful of responses that failed to
-    parse — see #253. Pixel repairs log at info (they worked); anything lost
-    logs at warning (it did not).
+    parse — see #253. A usable response in the prompt's alternate coordinate
+    representation logs at info; expected units are quiet. Anything lost logs
+    at warning.
     """
     if not counts:
         return
     lost = sum(counts.get(k, 0) for k in
                (_BBOX_OUT_OF_RANGE, _BBOX_MALFORMED, _BBOX_DEGENERATE))
-    repaired = counts.get(_BBOX_PIXELS, 0)
-    if repaired:
+    alternate_units = (
+        _BBOX_PIXELS if expected_units == _BBOX_NORMALIZED else _BBOX_NORMALIZED
+    )
+    converted = counts.get(alternate_units, 0)
+    if converted:
         logger.info(
-            "[%s] %s: %d bbox(es) arrived as pixels rather than the 0-1 "
-            "floats the prompt asks for; converted. (%d normalized.)",
-            name, backend, repaired, counts.get(_BBOX_NORMALIZED, 0),
+            "[%s] %s: %d bbox(es) arrived as %s rather than the %s "
+            "coordinates the prompt asks for; converted. (%d %s.)",
+            name, backend, converted, alternate_units, expected_units,
+            counts.get(expected_units, 0), expected_units,
         )
     if lost:
         logger.warning(
@@ -1026,7 +1039,12 @@ class LocalVLMBackend(VisionBackend):
                 "confidence": float(f.get("confidence", 0.0)),
                 "source": src,
             })
-        _log_bbox_dispositions(bbox_counts, image_path.name, self.name)
+        _log_bbox_dispositions(
+            bbox_counts,
+            image_path.name,
+            self.name,
+            expected_units=_BBOX_PIXELS,
+        )
         return out
 
 
